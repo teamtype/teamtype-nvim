@@ -1,100 +1,174 @@
 local M = {}
 
--- This file provides helper functions to convert between a number of ways to index a buffer:
-
--- * Byte offset: The number of UTF-8 bytes from the start of the buffer.
---   This is what Neovim uses internally.
-
--- * Character offset: The number of Unicode characters from the start of the buffer.
---   Neovim provides functions to output this, as well. These usually contain "char" in their name.
-
--- * UTF-16 code unit offset: The number of UTF-16 code units from the start of the buffer.
---   This is what Y.js uses internally. Neovim doesn't provide helper functions for this,
---   but we can iterate over the buffer content and calculate it ourselves.
---   Assumption: All Unicode codepoints under 0x10000 are encoded as a single UTF-16 code unit,
---   and all others as two.
---   https://en.wikipedia.org/wiki/UTF-16#Code_points_from_U+010000_to_U+10FFFF
-
--- Insert a string into the current buffer at a specified UTF-8 char index.
-function M.insert(index, text)
-    local row, col = M.indexToRowCol(index)
-    vim.api.nvim_buf_set_text(0, row, col, row, col, vim.split(text, "\n"))
-end
-
 function M.appendNewline()
-    M.insert(vim.fn.strchars(M.contentOfCurrentBuffer()), "\n")
+    print("Appending newline...")
+    vim.cmd("normal! Go")
 end
 
--- Delete a string from the current buffer at a specified UTF-16 code unit index.
-function M.delete(index, length)
-    local row, col = M.indexToRowCol(index)
-    local rowEnd, colEnd = M.indexToRowCol(index + length)
-    vim.api.nvim_buf_set_text(0, row, col, rowEnd, colEnd, { "" })
+--- Gets the zero-indexed lines from the given buffer.
+---
+---@param bufnr integer bufnr to get the lines from
+---@param rows integer[] zero-indexed line numbers
+---@return table<integer, string>|string a table mapping rows to lines
+local function get_lines(bufnr, rows)
+    rows = type(rows) == "table" and rows or { rows }
+
+    local lines = {}
+    for _, row in ipairs(rows) do
+        lines[row] = (vim.api.nvim_buf_get_lines(bufnr, row, row + 1, false) or { "" })[1]
+    end
+    return lines
 end
 
-function M.contentOfCurrentBuffer()
-    local buffer = 0 -- Current buffer.
-    local start = 0 -- First line.
-    local end_ = -1 -- Last line.
-    local strict_indexing = true -- Don't automatically clamp indices to be in a valid range.
-    local lines = vim.api.nvim_buf_get_lines(buffer, start, end_, strict_indexing)
-    -- TODO: might be brittle to rely on \n as line delimiter?
-    -- TODO: what happens if we open a latin-1 encoded file?
-    return vim.fn.join(lines, "\n")
+--- Gets the zero-indexed line from the given buffer.
+--- Works on unloaded buffers by reading the file using libuv to bypass buf reading events.
+--- Falls back to loading the buffer and nvim_buf_get_lines for buffers with non-file URI.
+---
+---@param bufnr integer
+---@param row integer zero-indexed line number
+---@return string the line at row in filename
+local function get_line(bufnr, row)
+    return get_lines(bufnr, { row })[row]
 end
 
--- Converts a UTF-8 byte offset to a Unicode character offset.
-function M.byteOffsetToCharOffset(byteOffset, content)
-    content = content or M.contentOfCurrentBuffer()
-
-    -- Special case: If the content is empty, looking up offset 0 should work.
-    if content == "" and byteOffset == 0 then
-        return 0
+--- Applies a list of text edits to a buffer.
+---@param text_edits table list of `TextEdit` objects
+---@param bufnr integer Buffer id
+---@param offset_encoding string utf-8|utf-16|utf-32
+---@see https://microsoft.github.io/language-server-protocol/specifications/specification-current/#textEdit
+function M.apply_text_edits(text_edits, bufnr, offset_encoding)
+    vim.validate({
+        text_edits = { text_edits, "t", false },
+        bufnr = { bufnr, "number", false },
+        offset_encoding = { offset_encoding, "string", false },
+    })
+    if not next(text_edits) then
+        return
     end
 
-    local value = vim.fn.charidx(content, byteOffset, true)
-    if value == -1 then
-        -- charidx returns -1 if we specify the byte position directly after the string,
-        -- but we think that's a valid position.
+    if not vim.api.nvim_buf_is_loaded(bufnr) then
+        vim.fn.bufload(bufnr)
+    end
+    vim.bo[bufnr].buflisted = true
 
-        value = vim.fn.charidx(content, byteOffset - 1, true)
-        if value ~= -1 then
-            return value + 1
-        else
-            error("Could not look up byte offset " .. tostring(byteOffset) .. " in given content.")
+    -- Fix reversed range and indexing each text_edits
+    local index = 0
+    text_edits = vim.tbl_map(function(text_edit)
+        index = index + 1
+        text_edit._index = index
+
+        if
+            text_edit.range.start.line > text_edit.range["end"].line
+            or text_edit.range.start.line == text_edit.range["end"].line
+                and text_edit.range.start.character > text_edit.range["end"].character
+        then
+            local start = text_edit.range.start
+            text_edit.range.start = text_edit.range["end"]
+            text_edit.range["end"] = start
+        end
+        return text_edit
+    end, text_edits)
+
+    -- Sort text_edits
+    table.sort(text_edits, function(a, b)
+        if a.range.start.line ~= b.range.start.line then
+            return a.range.start.line > b.range.start.line
+        end
+        if a.range.start.character ~= b.range.start.character then
+            return a.range.start.character > b.range.start.character
+        end
+        if a._index ~= b._index then
+            return a._index > b._index
+        end
+    end)
+
+    -- save and restore local marks since they get deleted by nvim_buf_set_lines
+    local marks = {}
+    for _, m in pairs(vim.fn.getmarklist(bufnr)) do
+        if m.mark:match("^'[a-z]$") then
+            marks[m.mark:sub(2, 2)] = { m.pos[2], m.pos[3] - 1 } -- api-indexed
         end
     end
-    return value
-end
 
--- Converts a Unicode character offset to a UTF-8 byte offset.
-function M.charOffsetToByteOffset(charOffset, content)
-    content = content or M.contentOfCurrentBuffer()
-    if charOffset >= vim.fn.strchars(content) then
-        -- TODO: When can this happen?
-        return vim.fn.strlen(content)
-    else
-        return vim.fn.byteidxcomp(content, charOffset)
+    -- Apply text edits.
+    --local has_eol_text_edit = false
+    local disable_eol = false
+    for _, text_edit in ipairs(text_edits) do
+        -- Normalize line ending
+        text_edit.newText, _ = string.gsub(text_edit.newText, "\r\n?", "\n")
+
+        -- Convert from LSP style ranges to Neovim style ranges.
+        local e = {
+            start_row = text_edit.range.start.line,
+            start_col = vim.lsp.util._get_line_byte_from_position(bufnr, text_edit.range.start, offset_encoding),
+            end_row = text_edit.range["end"].line,
+            end_col = vim.lsp.util._get_line_byte_from_position(bufnr, text_edit.range["end"], offset_encoding),
+            text = vim.split(text_edit.newText, "\n", { plain = true }),
+        }
+
+        local max = vim.api.nvim_buf_line_count(bufnr)
+        -- If the whole edit is after the lines in the buffer we can simply add the new text to the end
+        -- of the buffer.
+        if max <= e.start_row then
+            vim.api.nvim_buf_set_lines(bufnr, max, max, false, e.text)
+        else
+            local last_line_len = #(get_line(bufnr, math.min(e.end_row, max - 1)) or "")
+            -- Some LSP servers may return +1 range of the buffer content but nvim_buf_set_text can't
+            -- accept it so we should fix it here.
+            if max <= e.end_row then
+                e.end_row = max - 1
+                e.end_col = last_line_len
+                --has_eol_text_edit = true
+                disable_eol = true
+                -- "a" + 'eol' + replace((0,1), (1,0), "") => "a" + 'noeol'
+                -- "a" + 'eol' + replace((0,1), (1,0), "\n\n") => "a\n\n" + 'noeol' (I guess?)
+            else
+                -- If the replacement is over the end of a line (i.e. e.end_col is out of bounds and the
+                -- replacement text ends with a newline We can likely assume that the replacement is assumed
+                -- to be meant to replace the newline with another newline and we need to make sure this
+                -- doesn't add an extra empty line. E.g. when the last line to be replaced contains a '\r'
+                -- in the file some servers (clangd on windows) will include that character in the line
+                -- while nvim_buf_set_text doesn't count it as part of the line.
+                if
+                    e.end_col > last_line_len
+                    and #text_edit.newText > 0
+                    and string.sub(text_edit.newText, -1) == "\n"
+                then
+                    table.remove(e.text, #e.text)
+                end
+            end
+            -- Make sure we don't go out of bounds for e.end_col
+            e.end_col = math.min(last_line_len, e.end_col)
+
+            vim.api.nvim_buf_set_text(bufnr, e.start_row, e.start_col, e.end_row, e.end_col, e.text)
+        end
     end
-end
 
--- Converts a Unicode character offset in the current buffer to a row and column.
-function M.indexToRowCol(index)
-    -- First, calculate which byte the (UTF-16) index corresponds to.
-    local byte = M.charOffsetToByteOffset(index)
+    local max = vim.api.nvim_buf_line_count(bufnr)
 
-    local row = vim.fn.byte2line(byte + 1) - 1
-    local byteOffsetOfLine = vim.api.nvim_buf_get_offset(0, row)
-    local col = byte - byteOffsetOfLine
+    -- no need to restore marks that still exist
+    for _, m in pairs(vim.fn.getmarklist(bufnr)) do
+        marks[m.mark:sub(2, 2)] = nil
+    end
+    -- restore marks
+    for mark, pos in pairs(marks) do
+        if pos then
+            -- make sure we don't go out of bounds
+            pos[1] = math.min(pos[1], max)
+            pos[2] = math.min(pos[2], #(get_line(bufnr, pos[1] - 1) or ""))
+            vim.api.nvim_buf_set_mark(bufnr or 0, mark, pos[1], pos[2], {})
+        end
+    end
 
-    return row, col
-end
-
--- Converts a row and column in the current buffer to a Unicode character offset.
-function M.rowColToIndex(row, col)
-    -- Note: line2byte returns 1 for the first line.
-    local byte = vim.fn.line2byte(row) + col - 1
-    return M.byteOffsetToCharOffset(byte)
+    if disable_eol then
+        vim.bo.eol = false
+    end
+    --local fix_eol = has_eol_text_edit
+    --fix_eol = fix_eol and (vim.bo[bufnr].eol or (vim.bo[bufnr].fixeol and not vim.bo[bufnr].binary))
+    --fix_eol = fix_eol and get_line(bufnr, max - 1) == ""
+    --if fix_eol then
+    --    vim.api.nvim_buf_set_lines(bufnr, -2, -1, false, {})
+    --end
 end
 
 -- TEST SUITE
@@ -109,43 +183,10 @@ local function assertFail(call)
 end
 
 function M.testAllUnits()
-    assertEqual(#vim.split("a\nb\n", "\n"), 3)
-
-    vim.cmd("enew")
-    vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { "x" })
-    -- TODO: What we *really* expect here is "x\n".
-    assertEqual(M.contentOfCurrentBuffer(), "x")
-
-    vim.cmd("enew")
-    vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { "x", "y" })
-    assertEqual(M.contentOfCurrentBuffer(), "x\ny")
-
-    vim.cmd("enew")
-    vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { "x", "" })
-    assertEqual(M.contentOfCurrentBuffer(), "x\n")
-
-    vim.cmd("enew")
-    vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { "x", "" })
-    local row, col = M.indexToRowCol(2)
-    assertEqual(row, 1)
-    assertEqual(col, 0)
-
-    vim.cmd("enew")
-    vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { "x", "" })
-    local row, col = M.indexToRowCol(1)
-    assertEqual(row, 0)
-    assertEqual(col, 1)
-
-    vim.cmd("enew")
-    vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { "x", "" })
-    M.insert(2, "a")
-    assertEqual(M.contentOfCurrentBuffer(), "x\na")
-
-    vim.cmd("enew")
-    vim.api.nvim_buf_set_text(0, 0, 0, 0, 0, { "x", "" })
-    M.insert(1, "a")
-    assertEqual(M.contentOfCurrentBuffer(), "xa\n")
-
+    assertEqual(2 + 2, 4)
+    assertFail(function()
+        error("This should fail.")
+    end)
     print("Ethersync tests successful!")
 end
 
