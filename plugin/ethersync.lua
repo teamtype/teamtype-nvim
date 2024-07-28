@@ -1,170 +1,108 @@
-local utils = require("utils")
-local sync = require("vim.lsp.sync")
-
--- Used to note that changes to the buffer should be ignored, and not be sent out as deltas.
-local ignore_edits = false
+local changetracker = require("changetracker")
+local cursor = require("cursor")
 
 -- JSON-RPC connection.
 local client
 
--- Toggle to simulate the editor going offline.
-local online = false
--- Currently we're only supporting editing *one* file. This string identifies, which one that is.
-local theFile
+-- Registry of the files that are synced.
+local files = {}
 
--- Queues filled during simulated "offline" mode, and consumed when we go online again.
-local opQueueForDaemon = {}
-local opQueueForEditor = {}
-
--- Number of operations the daemon has made.
-local daemonRevision = 0
--- Number of operations we have made.
-local editorRevision = 0
-
--- Used to remember the previous content of the buffer, so that we can
--- calculate the difference between the previous and the current content.
-local prev_lines
-
-local function debug(tbl)
-    if true then
-        client.notify("debug", tbl)
-    end
-end
-
-local function applyDelta(delta)
-    local text_edits = {}
-    for _, replacement in ipairs(delta) do
-        local text_edit = {
-            range = {
-                start = replacement.range.anchor,
-                ["end"] = replacement.range.head,
-            },
-            newText = replacement.replacement,
-        }
-        table.insert(text_edits, text_edit)
-    end
-
-    -- Find correct buffer to apply edits to.
-    local bufnr = vim.uri_to_bufnr("file://" .. theFile)
-
-    ignore_edits = true
-    local changedtick_before = vim.api.nvim_buf_get_changedtick(bufnr)
-    utils.apply_text_edits(text_edits, bufnr, "utf-32")
-    local changedtick_after = vim.api.nvim_buf_get_changedtick(bufnr)
-    ignore_edits = false
-
-    debug({ changedtick_before = changedtick_before, changedtick_after = changedtick_after })
-
-    daemonRevision = daemonRevision + 1
+-- Pulled out as a method in case we want to add a new "offline simulation" later.
+local function send_notification(method, params)
+    client.notify(method, params)
 end
 
 -- Take an operation from the daemon and apply it to the editor.
-local function processOperationForEditor(method, parameters)
+local function process_operation_for_editor(method, parameters)
     if method == "edit" then
-        local _uri = parameters.uri --[[@diagnostic disable-line]]
+        local uri = parameters.uri
+        -- TODO: Determine the proper filepath (relative to project dir).
+        local filepath = vim.uri_to_fname(uri)
         local delta = parameters.delta.delta
-        local theEditorRevision = parameters.delta.revision
+        local the_editor_revision = parameters.delta.revision
 
-        if theEditorRevision == editorRevision then
-            applyDelta(delta)
-        else
-            -- Operation is not up-to-date to our content, skip it!
-            -- The daemon will send a transformed one later.
-            print(
-                "Skipping operation, my editor revision is "
-                    .. editorRevision
-                    .. " but operation is for revision "
-                    .. theEditorRevision
-            )
+        -- Check if operation is up-to-date to our content.
+        -- If it's not, ignore it! The daemon will send a transformed one later.
+        if the_editor_revision == files[filepath].editor_revision then
+            -- Find correct buffer to apply edits to.
+            local bufnr = vim.uri_to_bufnr(uri)
+
+            changetracker.apply_delta(bufnr, delta)
+
+            files[filepath].daemon_revision = files[filepath].daemon_revision + 1
         end
+    elseif method == "cursor" then
+        cursor.set_cursor(parameters.uri, parameters.userid, parameters.name, parameters.ranges)
     else
         print("Unknown method: " .. method)
     end
 end
 
--- Reset the state on editor side.
-local function resetState()
-    daemonRevision = 0
-    editorRevision = 0
-    opQueueForDaemon = {}
-    opQueueForEditor = {}
-end
-
 -- Connect to the daemon.
-local function connect(socket_path)
-    resetState()
-
-    local params = { "client" }
-    if socket_path then
-        table.insert(params, "--socket-path=" .. socket_path)
-    end
-    client = vim.lsp.rpc.start("ethersync", params, {
-        notification = function(method, notification_params)
-            if online then
-                processOperationForEditor(method, notification_params)
-            else
-                table.insert(opQueueForEditor, { method, notification_params })
-            end
-        end,
-    })
-    online = true
-end
-
--- Send "open" message to daemon for this buffer.
-local function openCurrentBuffer()
-    local uri = "file://" .. theFile
-    client.notify("open", { uri = uri })
-end
-
-local function connect2()
+local function connect()
     if client then
         client.terminate()
     end
-    connect("/tmp/etherbonk")
-    openCurrentBuffer()
-end
 
--- Simulate disconnecting from the daemon.
-local function goOffline()
-    online = false
-end
+    local params = { "client" }
 
--- Simulate connecting to the daemon again.
--- Apply both queues, then reset them.
-local function goOnline()
-    for _, op in ipairs(opQueueForDaemon) do
-        local method = op[1]
-        local params = op[2]
-        client.notify(method, params)
+    local socket_path = os.getenv("ETHERSYNC_SOCKET")
+    if socket_path then
+        table.insert(params, "--socket-path=" .. socket_path)
     end
 
-    for _, op in ipairs(opQueueForEditor) do
-        local method = op[1]
-        local params = op[2]
-        processOperationForEditor(method, params)
+    local dispatchers = {
+        notification = function(method, notification_params)
+            process_operation_for_editor(method, notification_params)
+        end,
+        on_error = function(code, ...)
+            print("Ethersync client connection error: ", code, vim.inspect({ ... }))
+        end,
+        on_exit = function(...)
+            print("Ethersync client connection exited: ", vim.inspect({ ... }))
+        end,
+    }
+
+    if vim.version().api_level < 12 then
+        -- In Vim 0.9, the API was to pass the command and its parameters as two arguments.
+        ---@diagnostic disable-next-line: param-type-mismatch
+        client = vim.lsp.rpc.start("ethersync", params, dispatchers)
+    else
+        -- While in Vim 0.10, it is combined into one table.
+        local cmd = params
+        table.insert(cmd, 1, "ethersync")
+        client = vim.lsp.rpc.start(cmd, dispatchers)
     end
 
-    opQueueForDaemon = {}
-    opQueueForEditor = {}
-    online = true
+    print("Connected to Ethersync daemon!")
+end
+
+local function is_ethersync_enabled(filename)
+    -- Recusively scan up directories. If we find an .ethersync directory on any level, return true.
+    return vim.fs.root(filename, ".ethersync") ~= nil
 end
 
 -- Forward buffer edits to daemon as well as subscribe to daemon events ("open").
-function EthersyncOpenBuffer()
-    if vim.fn.isdirectory(vim.fn.expand("%:p:h") .. "/.ethersync") ~= 1 then
+local function on_buffer_open()
+    local filename = vim.fn.expand("%:p")
+
+    if not is_ethersync_enabled(filename) then
         return
     end
 
-    if not theFile then
-        -- Only sync the *first* file loaded and nothing else.
-        theFile = vim.fn.expand("%:p")
+    if not client then
         connect()
-        print("Ethersync activated for file " .. theFile)
     end
 
-    if theFile ~= vim.fn.expand("%:p") then
-        return
-    end
+    files[filename] = {
+        -- Number of operations the daemon has made.
+        daemon_revision = 0,
+        -- Number of operations we have made.
+        editor_revision = 0,
+    }
+
+    local uri = "file://" .. filename
+    send_notification("open", { uri = uri })
 
     -- Vim enables eol for an empty file, but we do use this option values
     -- assuming there's a trailing newline iff eol is true.
@@ -172,113 +110,56 @@ function EthersyncOpenBuffer()
         vim.bo.eol = false
     end
 
-    prev_lines = vim.api.nvim_buf_get_lines(0, 0, -1, true)
+    changetracker.track_changes(0, function(delta)
+        files[filename].editor_revision = files[filename].editor_revision + 1
 
-    openCurrentBuffer()
+        local rev_delta = {
+            delta = delta,
+            revision = files[filename].daemon_revision,
+        }
 
-    vim.api.nvim_buf_attach(0, false, {
-        on_lines = function(
-            _the_literal_string_lines --[[@diagnostic disable-line]],
-            _buffer_handle --[[@diagnostic disable-line]],
-            _changedtick, --[[@diagnostic disable-line]]
-            first_line,
-            last_line,
-            new_last_line
-        )
-            -- Line counts that we get called with are zero-based.
-            -- last_line and new_last_line are exclusive
+        local params = { uri = uri, delta = rev_delta }
 
-            debug({ first_line = first_line, last_line = last_line, new_last_line = new_last_line })
-            -- TODO: optimize with a cache
-            local curr_lines = vim.api.nvim_buf_get_lines(0, 0, -1, true)
-
-            -- Are we currently ignoring edits?
-            if ignore_edits then
-                prev_lines = curr_lines
-                return
-            end
-
-            editorRevision = editorRevision + 1
-
-            debug({ curr_lines = curr_lines, prev_lines = prev_lines })
-            local diff = sync.compute_diff(prev_lines, curr_lines, first_line, last_line, new_last_line, "utf-32", "\n")
-            -- line/character indices in diff are zero-based.
-            debug({ diff = diff })
-
-            -- Sometimes, Vim deletes full lines by deleting the last line, plus an imaginary newline at the end. For example, to delete the second line, Vim would delete from (line: 1, column: 0) to (line: 2, column 0).
-            -- But, in the case of deleting the last line, what we expect in the rest of Ethersync is to delete the newline *before* the line.
-            -- So let's change the deleted range to (line: 0, column: [last character of the first line]) to (line: 1, column: [last character of the second line]).
-
-            if diff.range["end"].line == #prev_lines then
-                -- Range spans to a line one after the visible buffer lines.
-                if diff.range["start"].line == 0 then
-                    -- The range starts on the first line, so we can't "shift the range backwards".
-                    -- Instead, we just shorten the range by one character.
-                    diff.range["end"].line = diff.range["end"].line - 1
-                    diff.range["end"].character = vim.fn.strchars(prev_lines[#prev_lines])
-                    if string.sub(diff.text, vim.fn.strchars(diff.text)) == "\n" then
-                        -- The replacement ends with a newline.
-                        -- Drop it, because we shortened the range not to include the newline.
-                        diff.text = string.sub(diff.text, 1, -2)
-                    end
-                else
-                    -- The range doesn't start on the first line.
-                    if diff.range["start"].character == 0 then
-                        -- Operation applies to beginning of line, that means it's possible to shift it back.
-                        -- Modify edit, s.t. not the last \n, but the one before is replaced.
-                        diff.range["start"].line = diff.range["start"].line - 1
-                        diff.range["end"].line = diff.range["end"].line - 1
-                        diff.range["start"].character = vim.fn.strchars(prev_lines[diff.range["start"].line + 1], false)
-                        diff.range["end"].character = vim.fn.strchars(prev_lines[diff.range["end"].line + 1], false)
-                    end
-                end
-            end
-
-            local rev_delta = {
-                delta = {
-                    {
-                        range = {
-                            anchor = diff.range.start,
-                            head = diff.range["end"],
-                        },
-                        replacement = diff.text,
-                    },
-                },
-                revision = daemonRevision,
-            }
-
-            local uri = "file://" .. vim.api.nvim_buf_get_name(0)
-            local params = { uri = uri, delta = rev_delta }
-
-            if online then
-                client.notify("edit", params)
-            else
-                table.insert(opQueueForDaemon, { "edit", params })
-            end
-
-            prev_lines = curr_lines
-        end,
-    })
+        send_notification("edit", params)
+    end)
+    cursor.track_cursor(0, function(ranges)
+        local params = { uri = uri, ranges = ranges }
+        send_notification("cursor", params)
+    end)
 end
 
-function EthersyncCloseBuffer()
-    local closedFile = vim.fn.expand("<afile>:p")
-    if theFile ~= closedFile then
+local function on_buffer_close()
+    local closed_file = vim.fn.expand("<afile>:p")
+
+    if not is_ethersync_enabled(closed_file) then
         return
     end
+
+    if not files[closed_file] then
+        return
+    end
+
+    files[closed_file] = nil
+
     -- TODO: Is the on_lines callback un-registered automatically when the buffer closes,
     -- or should we detach it ourselves?
     -- vim.api.nvim_buf_detach(0) isn't a thing. https://github.com/neovim/neovim/issues/17874
     -- It's not a high priority, as we can only generate edits when the buffer exists anyways.
-    local uri = "file://" .. closedFile
-    client.notify("close", { uri = uri })
+
+    local uri = "file://" .. closed_file
+    send_notification("close", { uri = uri })
 end
 
-vim.api.nvim_create_autocmd({ "BufRead", "BufNewFile" }, { callback = EthersyncOpenBuffer })
-vim.api.nvim_create_autocmd("BufUnload", { callback = EthersyncCloseBuffer })
+local function print_info()
+    if client then
+        print("Connected to Ethersync daemon." .. "\n" .. cursor.list_cursors())
+    else
+        print("Not connected to Ethersync daemon.")
+    end
+end
 
-vim.api.nvim_create_user_command("EthersyncRunTests", utils.testAllUnits, {})
-vim.api.nvim_create_user_command("EthersyncGoOffline", goOffline, {})
-vim.api.nvim_create_user_command("EthersyncGoOnline", goOnline, {})
-vim.api.nvim_create_user_command("EthersyncReload", resetState, {})
-vim.api.nvim_create_user_command("Etherbonk", connect2, {})
+vim.api.nvim_create_autocmd({ "BufRead", "BufNewFile" }, { callback = on_buffer_open })
+vim.api.nvim_create_autocmd("BufUnload", { callback = on_buffer_close })
+
+vim.api.nvim_create_user_command("EthersyncInfo", print_info, {})
+vim.api.nvim_create_user_command("EthersyncJumpToCursor", cursor.jump_to_cursor, {})
