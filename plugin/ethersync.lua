@@ -1,5 +1,6 @@
 local changetracker = require("changetracker")
 local cursor = require("cursor")
+local debug = require("logging").debug
 
 -- JSON-RPC connection.
 local client
@@ -10,6 +11,25 @@ local files = {}
 -- Pulled out as a method in case we want to add a new "offline simulation" later.
 local function send_notification(method, params)
     client.notify(method, params)
+end
+
+local function send_request(method, params, result_callback, err_callback)
+    err_callback = err_callback or function() end
+    result_callback = result_callback or function() end
+
+    client.request(method, params, function(err, result)
+        if err then
+            local error_msg = "[ethersync] Error for '" .. method .. "': " .. err.message
+            if err.data and err.data ~= "" then
+                error_msg = error_msg .. " (" .. err.data .. ")"
+            end
+            vim.api.nvim_err_writeln(error_msg)
+            err_callback(err)
+        end
+        if result then
+            result_callback(result)
+        end
+    end)
 end
 
 -- Take an operation from the daemon and apply it to the editor.
@@ -46,11 +66,6 @@ local function connect()
 
     local params = { "client" }
 
-    local socket_path = os.getenv("ETHERSYNC_SOCKET")
-    if socket_path then
-        table.insert(params, "--socket-path=" .. socket_path)
-    end
-
     local dispatchers = {
         notification = function(method, notification_params)
             process_operation_for_editor(method, notification_params)
@@ -82,33 +97,13 @@ local function is_ethersync_enabled(filename)
     return vim.fs.root(filename, ".ethersync") ~= nil
 end
 
--- Forward buffer edits to daemon as well as subscribe to daemon events ("open").
-local function on_buffer_open()
-    local filename = vim.fn.expand("%:p")
-
-    if not is_ethersync_enabled(filename) then
-        return
-    end
-
-    if not client then
-        connect()
-    end
-
+local function track_edits(filename, uri)
     files[filename] = {
         -- Number of operations the daemon has made.
         daemon_revision = 0,
         -- Number of operations we have made.
         editor_revision = 0,
     }
-
-    local uri = "file://" .. filename
-    send_notification("open", { uri = uri })
-
-    -- Vim enables eol for an empty file, but we do use this option values
-    -- assuming there's a trailing newline iff eol is true.
-    if vim.fn.getfsize(vim.api.nvim_buf_get_name(0)) == 0 then
-        vim.bo.eol = false
-    end
 
     changetracker.track_changes(0, function(delta)
         files[filename].editor_revision = files[filename].editor_revision + 1
@@ -120,16 +115,46 @@ local function on_buffer_open()
 
         local params = { uri = uri, delta = rev_delta }
 
-        send_notification("edit", params)
+        send_request("edit", params)
     end)
     cursor.track_cursor(0, function(ranges)
         local params = { uri = uri, ranges = ranges }
-        send_notification("cursor", params)
+        -- Even though it's not "needed" we're sending requests in this case
+        -- to ensure we're processing/seeing potential errors.
+        send_request("cursor", params)
+    end)
+end
+
+-- Forward buffer edits to daemon as well as subscribe to daemon events ("open").
+local function on_buffer_open()
+    local filename = vim.fn.expand("%:p")
+    debug("on_buffer_open: " .. filename)
+
+    if not is_ethersync_enabled(filename) then
+        return
+    end
+
+    if not client then
+        connect()
+    end
+
+    local uri = "file://" .. filename
+
+    -- Vim enables eol for an empty file, but we do use this option values
+    -- assuming there's a trailing newline iff eol is true.
+    if vim.fn.getfsize(vim.api.nvim_buf_get_name(0)) == 0 then
+        vim.bo.eol = false
+    end
+
+    send_request("open", { uri = uri }, function()
+        debug("Tracking Edits")
+        track_edits(filename, uri)
     end)
 end
 
 local function on_buffer_close()
     local closed_file = vim.fn.expand("<afile>:p")
+    debug("on_buffer_close: " .. closed_file)
 
     if not is_ethersync_enabled(closed_file) then
         return
