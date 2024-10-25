@@ -38,8 +38,8 @@ local function process_operation_for_editor(method, parameters)
         local uri = parameters.uri
         -- TODO: Determine the proper filepath (relative to project dir).
         local filepath = vim.uri_to_fname(uri)
-        local delta = parameters.delta.delta
-        local the_editor_revision = parameters.delta.revision
+        local delta = parameters.delta
+        local the_editor_revision = parameters.revision
 
         -- Check if operation is up-to-date to our content.
         -- If it's not, ignore it! The daemon will send a transformed one later.
@@ -97,13 +97,18 @@ local function is_ethersync_enabled(filename)
     if vim.version().api_level < 12 then
         -- In Vim 0.9, do it manually.
         local path = filename
-        while path ~= "/" do
+        while true do
             if vim.fn.isdirectory(path .. "/.ethersync") == 1 then
                 return true
             end
-            path = vim.fn.fnamemodify(path, ":h")
+            local parentPath = vim.fn.fnamemodify(path, ":h")
+            if parentPath == path then
+                -- We can't progress further like this.
+                return false
+            else
+                path = parentPath
+            end
         end
-        return false
     else
         -- In Vim 0.10, this function is available.
         return vim.fs.root(filename, ".ethersync") ~= nil
@@ -121,12 +126,7 @@ local function track_edits(filename, uri)
     changetracker.track_changes(0, function(delta)
         files[filename].editor_revision = files[filename].editor_revision + 1
 
-        local rev_delta = {
-            delta = delta,
-            revision = files[filename].daemon_revision,
-        }
-
-        local params = { uri = uri, delta = rev_delta }
+        local params = { uri = uri, delta = delta, revision = files[filename].daemon_revision }
 
         send_request("edit", params)
     end)
