@@ -1,3 +1,8 @@
+-- SPDX-FileCopyrightText: 2024 blinry <mail@blinry.org>
+-- SPDX-FileCopyrightText: 2024 zormit <nt4u@kpvn.de>
+--
+-- SPDX-License-Identifier: AGPL-3.0-or-later
+
 local M = {}
 
 -- This variable is a table that maps user IDs to a list of cursors.
@@ -215,6 +220,8 @@ function M.track_cursor(bufnr, callback)
             callback(ranges)
         end,
     })
+    -- Trigger the callback above once, to send initial cursor position.
+    vim.api.nvim_exec_autocmds("CursorMoved", {})
 end
 
 function M.jump_to_cursor()

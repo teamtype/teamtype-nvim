@@ -1,3 +1,8 @@
+-- SPDX-FileCopyrightText: 2024 blinry <mail@blinry.org>
+-- SPDX-FileCopyrightText: 2024 zormit <nt4u@kpvn.de>
+--
+-- SPDX-License-Identifier: AGPL-3.0-or-later
+
 local M = {}
 
 local logfile = os.getenv("ETHERSYNC_NVIM_LOGFILE")

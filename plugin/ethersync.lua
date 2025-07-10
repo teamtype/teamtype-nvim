@@ -1,9 +1,11 @@
+-- SPDX-FileCopyrightText: 2024 blinry <mail@blinry.org>
+-- SPDX-FileCopyrightText: 2024 zormit <nt4u@kpvn.de>
+--
+-- SPDX-License-Identifier: AGPL-3.0-or-later
+
 local changetracker = require("changetracker")
 local cursor = require("cursor")
 local debug = require("logging").debug
-
--- We only want to communicate a possibly annoying info once.
-local did_print_autoread_info = false
 
 -- JSON-RPC connection.
 local client
@@ -62,12 +64,12 @@ local function process_operation_for_editor(method, parameters)
 end
 
 -- Connect to the daemon.
-local function connect()
+local function connect(directory)
     if client then
         client.terminate()
     end
 
-    local params = { "client" }
+    local params = { "client", "--directory", directory }
 
     local dispatchers = {
         notification = function(method, notification_params)
@@ -95,26 +97,26 @@ local function connect()
     print("Connected to Ethersync daemon!")
 end
 
-local function is_ethersync_enabled(filename)
-    -- Recusively scan up directories. If we find an .ethersync directory on any level, return true.
+local function find_directory(filename)
+    -- Recusively scan up directories. If we find an .ethersync directory on any level, return its parent, and nil otherwise.
     if vim.version().api_level < 12 then
         -- In Vim 0.9, do it manually.
         local path = filename
         while true do
             if vim.fn.isdirectory(path .. "/.ethersync") == 1 then
-                return true
+                return path
             end
             local parentPath = vim.fn.fnamemodify(path, ":h")
             if parentPath == path then
                 -- We can't progress further like this.
-                return false
+                return nil
             else
                 path = parentPath
             end
         end
     else
         -- In Vim 0.10, this function is available.
-        return vim.fs.root(filename, ".ethersync") ~= nil
+        return vim.fs.root(filename, ".ethersync")
     end
 end
 
@@ -146,10 +148,6 @@ end
 -- For the conflicting case, we prevent a popup dialog by setting the FileChangedShell autocommand below.
 local function ensure_autoread_is_off()
     if vim.o.autoread then
-        if not did_print_autoread_info then
-            print("Ethersync works better when autoread is off, so we're disabling it for you (in Ethersync buffers).")
-            did_print_autoread_info = true
-        end
         vim.bo.autoread = false
     end
 end
@@ -159,12 +157,13 @@ local function on_buffer_open()
     local filename = vim.fn.expand("%:p")
     debug("on_buffer_open: " .. filename)
 
-    if not is_ethersync_enabled(filename) then
+    local directory = find_directory(filename)
+    if not directory then
         return
     end
 
     if not client then
-        connect()
+        connect(directory)
     end
 
     local uri = "file://" .. filename
@@ -194,7 +193,7 @@ local function on_buffer_close()
     local closed_file = vim.fn.expand("<afile>:p")
     debug("on_buffer_close: " .. closed_file)
 
-    if not is_ethersync_enabled(closed_file) then
+    if not find_directory(closed_file) then
         return
     end
 
