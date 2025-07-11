@@ -128,14 +128,16 @@ local function track_edits(filename, uri)
         editor_revision = 0,
     }
 
-    changetracker.track_changes(0, function(delta)
+    local bufnr = vim.uri_to_bufnr(uri)
+
+    changetracker.track_changes(bufnr, function(delta)
         files[filename].editor_revision = files[filename].editor_revision + 1
 
         local params = { uri = uri, delta = delta, revision = files[filename].daemon_revision }
 
         send_request("edit", params)
     end)
-    cursor.track_cursor(0, function(ranges)
+    cursor.track_cursor(bufnr, function(ranges)
         local params = { uri = uri, ranges = ranges }
         -- Even though it's not "needed" we're sending requests in this case
         -- to ensure we're processing/seeing potential errors.
@@ -150,6 +152,24 @@ local function ensure_autoread_is_off()
     if vim.o.autoread then
         vim.bo.autoread = false
     end
+end
+
+-- In ethersync-ed buffers, "writing" is no longer a concept. We also want to avoid error messages
+-- when the file has changed on disk, so make all writing operations a no-op.
+local function disable_writing()
+    local buf = vim.api.nvim_get_current_buf()
+    local autocmd_arg = {
+        buffer = buf,
+        callback = function()
+            -- Trigger this autocommand so that plugins like autoformatters still work.
+            vim.api.nvim_exec_autocmds("BufWritePre", {
+                buffer = buf,
+            })
+        end,
+    }
+    vim.api.nvim_create_autocmd("BufWriteCmd", autocmd_arg)
+    vim.api.nvim_create_autocmd("FileWriteCmd", autocmd_arg)
+    vim.api.nvim_create_autocmd("FileAppendCmd", autocmd_arg)
 end
 
 -- Forward buffer edits to daemon as well as subscribe to daemon events ("open").
@@ -177,6 +197,7 @@ local function on_buffer_open()
     send_request("open", { uri = uri }, function()
         debug("Tracking Edits")
         ensure_autoread_is_off()
+        disable_writing()
         track_edits(filename, uri)
     end)
 end
