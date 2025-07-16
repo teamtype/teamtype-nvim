@@ -69,6 +69,13 @@ local function connect(directory)
         client.terminate()
     end
 
+    if vim.fn.executable("ethersync") == 0 then
+        vim.api.nvim_err_writeln(
+            "Tried to connect to the Ethersync daemon, but `ethersync` executable was not found. Make sure that is in your PATH."
+        )
+        return false
+    end
+
     local params = { "client", "--directory", directory }
 
     local dispatchers = {
@@ -78,8 +85,21 @@ local function connect(directory)
         on_error = function(code, ...)
             print("Ethersync client connection error: ", code, vim.inspect({ ... }))
         end,
-        on_exit = function(...)
-            print("Ethersync client connection exited: ", vim.inspect({ ... }))
+        on_exit = function(code, _)
+            if code == 0 then
+                vim.schedule(function()
+                    vim.api.nvim_err_writeln(
+                        "Connection to Ethersync daemon lost. Probably it crashed or was stopped. Please restart the daemon, then Neovim."
+                    )
+                    -- TODO: Enable writing here again, so that user can make backup of file?
+                end)
+            else
+                print(
+                    "Could not connect to Ethersync daemon. Did you start it (in "
+                        .. directory
+                        .. ")? To stop trying, remove the .ethersync/ directory."
+                )
+            end
         end,
     }
 
@@ -95,6 +115,7 @@ local function connect(directory)
     end
 
     print("Connected to Ethersync daemon!")
+    return true
 end
 
 local function find_directory(filename)
@@ -183,7 +204,10 @@ local function on_buffer_open()
     end
 
     if not client then
-        connect(directory)
+        local success = connect(directory)
+        if not success then
+            return
+        end
     end
 
     local uri = "file://" .. filename
