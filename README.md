@@ -5,7 +5,12 @@ SPDX-FileCopyrightText: 2024 zormit <nt4u@kpvn.de>
 SPDX-License-Identifier: CC-BY-SA-4.0
 -->
 
-# Neovim plugin for 🍃 [Ethersync](https://github.com/ethersync/ethersync)
+# Neovim plugin for 🍃 [Ethersync](https://github.com/ethersync/ethersync)-compatible collaborative software
+
+This plugin adds real-time collaborative editing functionality to Neovim.
+You can use it for pair programming or note-taking, for example. It is mainly
+meant to be used with Ethersync, but can also be configured to work with other
+collaborative software speaking the same protocol.
 
 > [!IMPORTANT]
 >
@@ -30,7 +35,11 @@ Usually, you will add the string `"ethersync/ethersync-nvim"` to your plugin man
 ```lua
 {
   "ethersync/ethersync-nvim",
-  keys = { { "<leader>j", "<cmd>EthersyncJumpToCursor<cr>" } },
+  keys = { 
+    { "<leader>ej", "<cmd>EthersyncJumpToCursor<cr>" },
+    { "<leader>ef", "<cmd>EthersyncFollow<cr>" },
+    { "<esc>", mode = { "n" }, "<cmd>EthersyncUnfollow<cr>" },
+  },
   lazy = false,
 }
 ```
@@ -41,7 +50,9 @@ Usually, you will add the string `"ethersync/ethersync-nvim"` to your plugin man
 {
   "ethersync/ethersync-nvim",
   config = function()
-    vim.keymap.set('n', '<leader>j', '<cmd>EthersyncJumpToCursor<cr>')
+    vim.keymap.set('n', '<leader>ej', '<cmd>EthersyncJumpToCursor<cr>')
+    vim.keymap.set('n', '<leader>ef', '<cmd>EthersyncFollow<cr>')
+    vim.keymap.set('n', '<esc>', '<cmd>EthersyncUnfollow<cr>')
   end
 }
 ```
@@ -60,4 +71,8 @@ To confirm that the plugin is installed, try running the `:EthersyncInfo` comman
 
 ## Tips
 
-We recommend creating a mapping for the `:EthersyncJumpToCursor` command (for example, `<Leader>j`, which jumps to another user's cursor.
+We recommend creating mappings for the `:EthersyncJumpToCursor`, `:EthersyncFollow` and `EthersyncUnfollow` command, see above configurations for examples.
+
+## Configuration
+
+See the [help file](doc/ethersync.txt) for details on configuring this plugin.
