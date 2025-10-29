@@ -16,7 +16,7 @@ local M = {}
 --    }
 -- }
 local user_cursors = {}
-local cursor_namespace = vim.api.nvim_create_namespace("Ethersync")
+local cursor_namespace = vim.api.nvim_create_namespace("Teamtype")
 local offset_encoding = "utf-32"
 local cursor_timeout_ms = 300 * 1000
 local following_user_id = nil
@@ -29,7 +29,7 @@ end
 vim.api.nvim_create_autocmd("ColorScheme", {
     pattern = "*",
     callback = function()
-        vim.api.nvim_set_hl(0, "EthersyncUsername", { fg = "#808080", ctermfg = 12 })
+        vim.api.nvim_set_hl(0, "TeamtypeUsername", { fg = "#808080", ctermfg = 12 })
     end,
 })
 vim.api.nvim_exec_autocmds("ColorScheme", {})
@@ -114,7 +114,7 @@ function M.set_cursor(uri, user_id, name, ranges)
 
             local virt_text = {}
             if i == 1 and name then
-                virt_text = { { name, "EthersyncUsername" } }
+                virt_text = { { name, "TeamtypeUsername" } }
             end
 
             -- Try setting the extmark, ignore errors (which can happen at end of lines/buffers).
@@ -248,10 +248,12 @@ function M.track_cursor(bufnr, callback)
     vim.api.nvim_exec_autocmds("CursorMoved", {})
 end
 
-function M.unfollow_cursor()
+local on_key_nsid = nil
+local function unfollow_cursor()
     if following_user_id ~= nil then
         print("Unfollowed cursor")
         following_user_id = nil
+        vim.on_key(nil, on_key_nsid)
     end
 end
 
@@ -325,8 +327,16 @@ end
 function M.follow_cursor()
     local callback = function(user_id)
         print("Following cursor")
+        jump_to_user_id(user_id)
         following_user_id = user_id
-        jump_to_user_id(following_user_id)
+
+        on_key_nsid = vim.on_key(function(_, typed)
+            -- {typed} may be empty if the first argument is produced by non-typed key(s) or by the same typed key(s) that produced a previous {key}
+            -- on_key is triggered even when the followee moves/types, but {typed} is empty in this case
+            if following_user_id ~= nil and typed ~= nil and typed ~= "" then
+                unfollow_cursor()
+            end
+        end)
     end
     pick_cursor_menu(callback)
 end
