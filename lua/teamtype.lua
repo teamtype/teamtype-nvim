@@ -45,6 +45,23 @@ function M.enable(name, enable)
     configurations[name].enabled = enable
 end
 
+function M.status()
+    if #clients == 0 then
+        return ""
+    end
+
+    local result = "Teamtype: "
+
+    local n = cursor.number_of_cursors()
+    if n > 0 then
+        result = result .. cursor.short_cursor_description()
+    else
+        result = result .. "active"
+    end
+
+    return result
+end
+
 -- Take an operation from the daemon and apply it to the editor.
 local function process_operation_for_editor(client, method, parameters)
     if method == "edit" then
@@ -139,9 +156,60 @@ local function find_or_create_client(config_name, root_dir)
         buffers = {},
         connection = nil,
     }
-    local the_connection = connection.connect(configurations[config_name].cfg.cmd, root_dir, function(m, p)
-        process_operation_for_editor(client, m, p)
-    end)
+
+    -- TODO: Encapsulate these dispatchers in the connection module better?
+    local dispatchers = {
+        notification = function(m, p)
+            process_operation_for_editor(client, m, p)
+        end,
+        on_error = function(code, ...)
+            print("Teamtype connection error: ", code, vim.inspect({ ... }))
+        end,
+        on_exit = function(code, _)
+            if code == 0 then
+                vim.schedule(function()
+                    vim.api.nvim_err_writeln(
+                        "Connection to Teamtype daemon lost. Probably it crashed or was stopped. Please restart the daemon, then Neovim."
+                    )
+                end)
+            else
+                print(
+                    "Could not connect to Teamtype daemon. Did you start it (in "
+                        .. root_dir
+                        .. ")? To stop trying, remove the .teamtype/ directory."
+                )
+            end
+
+            vim.schedule(function()
+                -- React to disconnect.
+                local to_remove = {}
+                for i, c in ipairs(clients) do
+                    if c == client then
+                        to_remove[i] = true
+
+                        -- If the daemon crashed, prevent modifications to the buffers to save users from
+                        -- accidental data losss.
+                        if code == 0 then
+                            for _, buf_nr in ipairs(c.buffers) do
+                                vim.bo[buf_nr].modifiable = false
+
+                                -- TODO: Enable writing here again, so that user can make backup of file?
+                            end
+                        end
+                    end
+                end
+
+                -- Remove from clients list.
+                for i = #clients, 1, -1 do
+                    if to_remove[i] then
+                        table.remove(clients, i)
+                    end
+                end
+            end)
+        end,
+    }
+
+    local the_connection = connection.connect(configurations[config_name].cfg.cmd, root_dir, dispatchers)
     client.connection = the_connection
     table.insert(clients, client)
 
