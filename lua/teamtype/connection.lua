@@ -5,7 +5,7 @@
 
 local M = {}
 
--- A Connection represents an ative JSON-RPC connection.
+-- A Connection represents an active JSON-RPC connection.
 local Connection = {}
 
 function Connection:is_connected()
@@ -36,7 +36,7 @@ function Connection:send_request(method, params, result_callback, err_callback)
 end
 
 -- Connect to the daemon, and return a handle on the connection.
-function M.connect(cmd, directory, on_notification)
+function M.connect(cmd, directory, dispatchers)
     local executable = cmd[1]
     if vim.fn.executable(executable) == 0 then
         vim.api.nvim_err_writeln(
@@ -46,29 +46,6 @@ function M.connect(cmd, directory, on_notification)
         )
         return nil
     end
-
-    local dispatchers = {
-        notification = on_notification,
-        on_error = function(code, ...)
-            print("Teamtype connection error: ", code, vim.inspect({ ... }))
-        end,
-        on_exit = function(code, _)
-            if code == 0 then
-                vim.schedule(function()
-                    vim.api.nvim_err_writeln(
-                        "Connection to Teamtype daemon lost. Probably it crashed or was stopped. Please restart the daemon, then Neovim."
-                    )
-                    -- TODO: Enable writing here again, so that user can make backup of file?
-                end)
-            else
-                print(
-                    "Could not connect to Teamtype daemon. Did you start it (in "
-                        .. directory
-                        .. ")? To stop trying, remove the .teamtype/ directory."
-                )
-            end
-        end,
-    }
 
     local connection
     local extra_spawn_params = { cwd = directory }

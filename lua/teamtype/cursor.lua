@@ -20,6 +20,8 @@ local cursor_namespace = vim.api.nvim_create_namespace("Teamtype")
 local offset_encoding = "utf-32"
 local cursor_timeout_ms = 300 * 1000
 local following_user_id = nil
+-- keeps track across ModeChanged events whether the last mode was visual
+local was_visual_selection = nil
 
 local function show_cursor_information(name, cursor)
     return (name or "Unknown user") .. " @ " .. vim.uri_to_fname(cursor.uri) .. ":" .. cursor.range.start.line + 1
@@ -153,11 +155,18 @@ end
 function M.track_cursor(bufnr, callback)
     vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "ModeChanged" }, {
         buffer = bufnr,
-        callback = function()
+        callback = function(ev)
             local ranges = {}
 
             -- TODO: Split this code into multiple functions.
             local visualSelection = vim.fn.mode() == "v" or vim.fn.mode() == "V" or vim.fn.mode() == ""
+
+            -- We only care about "ModeChanged" if we were in visual mode to clear the range seen by the peer.
+            if ev.event == "ModeChanged" and not was_visual_selection then
+                return
+            end
+            was_visual_selection = visualSelection
+
             if visualSelection then
                 -- This is the "active end" that the protocol talks about.
                 local end_row, end_col = unpack(vim.api.nvim_win_get_cursor(0))
@@ -346,6 +355,48 @@ function M.jump_to_cursor()
         jump_to_user_id(user_id)
     end
     pick_cursor_menu(callback)
+end
+
+function M.number_of_cursors()
+    local count = 0
+    for _, v in pairs(user_cursors) do
+        if #v.cursors > 0 then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- Returns a description of remote cursors that are known to us.
+function M.short_cursor_description()
+    local users = {}
+
+    -- Build a structure using the values as keys, so they are de-duplicated.
+    for _, data in pairs(user_cursors) do
+        if #data.cursors > 0 then
+            if not users[data.name] then
+                users[data.name] = {}
+            end
+            for _, c in ipairs(data.cursors) do
+                users[data.name][vim.fs.basename(c.uri)] = true
+            end
+        end
+    end
+
+    -- Now, build a string that we can return.
+    local user_list = {}
+
+    for name, files in pairs(users) do
+        local file_list = {}
+
+        for file, _ in pairs(files) do
+            table.insert(file_list, file)
+        end
+
+        table.insert(user_list, name .. " (" .. table.concat(file_list, ", ") .. ")")
+    end
+
+    return table.concat(user_list, ", ")
 end
 
 function M.list_cursors()
